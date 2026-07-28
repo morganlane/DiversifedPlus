@@ -1,0 +1,113 @@
+name: Validate Static Site
+
+on:
+  push:
+    branches:
+      - agent/github-approved-v67
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate required files and repository limits
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f index.html
+          test -s assets/css/diversified-plus-organized.css
+
+          html_count="$(find . -maxdepth 1 -type f -name '*.html' | wc -l | tr -d ' ')"
+          echo "Root HTML pages: ${html_count}"
+          test "${html_count}" -ge 38
+
+          if find . -type f -size +95M -print -quit | grep -q .; then
+            echo 'Files larger than 95 MB were found:'
+            find . -type f -size +95M -print
+            exit 1
+          fi
+
+          if find . -type f \( -name '.DS_Store' -o -name 'Thumbs.db' -o -path '*/__MACOSX/*' \) -print -quit | grep -q .; then
+            echo 'Operating-system metadata files were found.'
+            exit 1
+          fi
+
+          if find . -type f -name '*.zip' -print -quit | grep -q .; then
+            echo 'Nested ZIP archives are not allowed in the repository package.'
+            exit 1
+          fi
+
+      - name: Verify organized stylesheet references
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=0
+          while IFS= read -r page; do
+            if ! grep -Fq 'assets/css/diversified-plus-organized.css' "$page"; then
+              echo "Missing organized stylesheet reference: $page"
+              missing=1
+            fi
+          done < <(find . -maxdepth 1 -type f -name '*.html' -print | sort)
+
+          exit "$missing"
+
+      - name: Check local HTML asset links
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from urllib.parse import unquote, urlparse
+
+          root = Path('.').resolve()
+          missing = []
+
+          class AssetParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.urls = []
+
+              def handle_starttag(self, tag, attrs):
+                  values = dict(attrs)
+                  for key in ('href', 'src', 'poster'):
+                      value = values.get(key)
+                      if value:
+                          self.urls.append(value)
+
+          for page in sorted(Path('.').glob('*.html')):
+              parser = AssetParser()
+              parser.feed(page.read_text(encoding='utf-8', errors='ignore'))
+              for raw in parser.urls:
+                  if raw.startswith(('#', 'mailto:', 'tel:', 'javascript:', 'data:')):
+                      continue
+                  parsed = urlparse(raw)
+                  if parsed.scheme or parsed.netloc:
+                      continue
+                  path = unquote(parsed.path)
+                  if not path or path == '/':
+                      continue
+                  target = (page.parent / path.lstrip('/')).resolve()
+                  try:
+                      target.relative_to(root)
+                  except ValueError:
+                      continue
+                  if not target.exists():
+                      missing.append(f'{page}: {raw}')
+
+          if missing:
+              print('Missing local files:')
+              print('\n'.join(missing))
+              raise SystemExit(1)
+
+          print('All parsed local HTML asset links resolve.')
+          PY
